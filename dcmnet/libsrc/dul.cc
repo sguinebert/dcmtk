@@ -80,6 +80,28 @@
 #include "dcmtk/dcmnet/diutil.h"
 
 BEGIN_EXTERN_C
+#include <arpa/inet.h>
+#include <dlfcn.h>
+#include <errno.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+
+#include <unistd.h>
+
+#include "strtonum.h"
+
+enum {
+  LIBPROXYPROTO_V1 = (1 << 0),
+  LIBPROXYPROTO_V2 = (1 << 1),
+};
 #ifdef HAVE_SYS_TIME_H
 #include <sys/time.h>
 #endif
@@ -109,6 +131,247 @@ typedef void(*mySIG_TYP)(...);
 #else
 typedef void(*mySIG_TYP)(int);
 #endif
+//libproxyproto
+#ifdef _init
+#undef _init  // no statements in between
+#endif
+
+int (*sys_accept)(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
+#pragma GCC diagnostic ignored "-Wpedantic"
+int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
+#pragma GCC diagnostic warning "-Wpedantic"
+int read_evt(int fd, struct sockaddr *from, socklen_t *fromlen);
+
+const char v2sig[13] = "\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A";
+
+const char *debug = 0;
+const char *must_use_protocol_header = 0;
+int version = LIBPROXYPROTO_V1 | LIBPROXYPROTO_V2;
+
+int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
+#pragma GCC diagnostic ignored "-Wpedantic"
+  sys_accept = (int (*)(int, struct sockaddr *, socklen_t *))dlsym(RTLD_NEXT, "accept");
+  int fd;
+
+  fd = sys_accept(sockfd, addr, addrlen);
+  if (fd < 0)
+    return fd;
+
+  if (debug)
+    (void)fprintf(stderr, "accepted connection\n");
+
+  if (read_evt(fd, addr, addrlen) <= 0) {
+    if (debug)
+      (void)fprintf(stderr, "error: not proxy protocol\n");
+
+    if (!must_use_protocol_header)
+      goto LIBPROXYPROTO_DONE;
+
+    if (debug)
+      (void)fprintf(stderr, "dropping connection\n");
+
+    (void)close(fd);
+    errno = ECONNABORTED;
+    return -1;
+  }
+
+LIBPROXYPROTO_DONE:
+  return fd;
+}
+
+/* returns 0 if needs to poll, <0 upon error or >0 if it did the job */
+int read_evt(int fd, struct sockaddr *from, socklen_t *fromlen) {
+  union {
+    struct {
+      char line[108];
+    } v1;
+    struct {
+      uint8_t sig[12];
+      uint8_t ver_cmd;
+      uint8_t fam;
+      uint16_t len;
+      union {
+        struct { /* for TCP/UDP over IPv4, len = 12 */
+          uint32_t src_addr;
+          uint32_t dst_addr;
+          uint16_t src_port;
+          uint16_t dst_port;
+        } ip4;
+        struct { /* for TCP/UDP over IPv6, len = 36 */
+          uint8_t src_addr[16];
+          uint8_t dst_addr[16];
+          uint16_t src_port;
+          uint16_t dst_port;
+        } ip6;
+        struct { /* for AF_UNIX sockets, len = 216 */
+          uint8_t src_addr[108];
+          uint8_t dst_addr[108];
+        } unx;
+      } addr;
+    } v2;
+  } hdr;
+
+  ssize_t size, ret;
+
+  do {
+    ret = recv(fd, &hdr, sizeof(hdr), MSG_PEEK);
+  } while (ret == -1 && errno == EINTR);
+
+  if (ret == -1)
+    return (errno == EAGAIN) ? 0 : -1;
+
+  if (ret >= 16 && memcmp(&hdr.v2, v2sig, 12) == 0 &&
+      (hdr.v2.ver_cmd & 0xF0) == 0x20) {
+    size = 16 + ntohs(hdr.v2.len);
+    if (ret < size)
+      return -1; /* truncated or too large header */
+
+    if (from == NULL || !(version & LIBPROXYPROTO_V2))
+      goto done;
+
+    switch (hdr.v2.ver_cmd & 0xF) {
+    case 0x01: /* PROXY command */
+      switch (hdr.v2.fam) {
+      case 0x11: /* TCPv4 */
+        if (*fromlen < sizeof(struct sockaddr_in))
+          return -1;
+        if (debug)
+          (void)fprintf(stderr, "*** orig addr=%s:%u\n",
+                        inet_ntoa(((struct sockaddr_in *)from)->sin_addr),
+                        ntohs(((struct sockaddr_in *)from)->sin_port));
+        ((struct sockaddr_in *)from)->sin_family = AF_INET;
+        ((struct sockaddr_in *)from)->sin_addr.s_addr =
+            hdr.v2.addr.ip4.src_addr;
+        ((struct sockaddr_in *)from)->sin_port = hdr.v2.addr.ip4.src_port;
+        if (debug)
+          (void)fprintf(stderr, "*** proxied addr=%s:%u\n",
+                        inet_ntoa(((struct sockaddr_in *)from)->sin_addr),
+                        ntohs(((struct sockaddr_in *)from)->sin_port));
+        goto done;
+      case 0x21: /* TCPv6 */
+        if (*fromlen < sizeof(struct sockaddr_in6))
+          return -1;
+        ((struct sockaddr_in6 *)from)->sin6_family = AF_INET6;
+        memcpy(&((struct sockaddr_in6 *)from)->sin6_addr,
+               hdr.v2.addr.ip6.src_addr, 16);
+        ((struct sockaddr_in6 *)from)->sin6_port = hdr.v2.addr.ip6.src_port;
+        goto done;
+      }
+      /* unsupported protocol, keep local connection address */
+      break;
+    case 0x00: /* LOCAL command */
+      /* keep local connection address for LOCAL */
+      break;
+    default:
+      return -1; /* not a supported command */
+    }
+  } else if (ret >= 8 && memcmp(hdr.v1.line, "PROXY", 5) == 0) {
+    char *end;
+
+    char *str, *token;
+    char *saveptr = NULL;
+    int j;
+    unsigned char buf[sizeof(struct in6_addr)] = {0};
+    uint16_t port;
+
+    end = (char*)memchr(hdr.v1.line, '\r', (size_t)ret - 1);
+
+    if (!end || end[1] != '\n')
+      return -1; /* partial or invalid header */
+
+    *end = '\0';                  /* terminate the string to ease parsing */
+    size = end + 2 - hdr.v1.line; /* skip header + CRLF */
+
+    if (from == NULL || !(version & LIBPROXYPROTO_V1))
+      goto done;
+
+    /* PROXY TCP4 255.255.255.255 255.255.255.255 65535 65535
+     * PROXY TCP6 ffff:f...f:ffff ffff:f...f:ffff 65535 65535
+     * PROXY UNKNOWN
+     * PROXY UNKNOWN ffff:f...f:ffff ffff:f...f:ffff 65535 65535
+     */
+    for (j = 1, str = hdr.v1.line;; j++, str = NULL) {
+      token = strtok_r(str, " ", &saveptr);
+      if (token == NULL)
+        return -1;
+
+      if (debug)
+        (void)fprintf(stderr, "v1:%d:%s\n", j, token);
+
+      switch (j) {
+      case 1:
+        /* PROXY */
+        continue;
+      case 2:
+        /* TCP4, TCP6, UNKNOWN */
+        if (strcmp(token, "UNKNOWN") == 0) {
+          goto done;
+        } else if (strcmp(token, "TCP4") == 0) {
+          if (*fromlen < sizeof(struct sockaddr_in))
+            return -1;
+          ((struct sockaddr_in *)from)->sin_family = AF_INET;
+        } else if (strcmp(token, "TCP6") == 0) {
+          if (*fromlen < sizeof(struct sockaddr_in6))
+            return -1;
+          ((struct sockaddr_in6 *)from)->sin6_family = AF_INET6;
+        } else {
+          return -1;
+        }
+        break;
+      case 3:
+        /* source address */
+        if (inet_pton(((struct sockaddr *)from)->sa_family, token, buf) != 1) {
+          return -1;
+        }
+        if (((struct sockaddr *)from)->sa_family == AF_INET) {
+          ((struct sockaddr_in *)from)->sin_addr.s_addr =
+              ((struct in_addr *)buf)->s_addr;
+        } else if (((struct sockaddr *)from)->sa_family == AF_INET6) {
+          (void)memcpy(hdr.v2.addr.ip6.src_addr, buf, 16);
+        }
+        break;
+      case 4:
+        /* destination address */
+        if (inet_pton(((struct sockaddr *)from)->sa_family, token, buf) != 1) {
+          return -1;
+        }
+        continue;
+      case 5:
+        /* source port */
+        errno = 0;
+        port = (uint16_t)strtonum(token, 0, UINT16_MAX, NULL);
+        if (errno)
+          return -1;
+
+        if (((struct sockaddr *)from)->sa_family == AF_INET) {
+          ((struct sockaddr_in *)from)->sin_port = htons(port);
+        } else if (((struct sockaddr *)from)->sa_family == AF_INET6) {
+          ((struct sockaddr_in6 *)from)->sin6_port = htons(port);
+        }
+        break;
+      case 6:
+        /* destination port */
+        errno = 0;
+        (void)strtonum(token, 0, UINT16_MAX, NULL);
+        if (errno)
+          return -1;
+        goto done;
+      default:
+        return -1;
+      }
+    }
+  } else {
+    /* Wrong protocol */
+    return -1;
+  }
+
+done:
+  /* we need to consume the appropriate amount of data from the socket */
+  do {
+    ret = recv(fd, &hdr, (size_t)size, 0);
+  } while (ret == -1 && errno == EINTR);
+  return (ret >= 0) ? 1 : -1;
+}
 END_EXTERN_C
 
 #ifdef DCMTK_HAVE_POLL
@@ -125,7 +388,7 @@ END_EXTERN_C
 #include "dcmtk/ofstd/ofstd.h"
 
 #include "dcmtk/dcmnet/dul.h"
-#include "dcmtk/dcmnet/dulstruc.h"
+#include "dulstruc.h"
 #include "dulpriv.h"
 #include "dulfsm.h"
 #include "dcmtk/dcmnet/dcmtrans.h"
@@ -1712,7 +1975,9 @@ receiveTransportConnectionTCP(PRIVATE_NETWORKKEY ** network,
         len = sizeof(from);
         do
         {
+
             sock = accept((*network)->networkSpecific.TCP.listenSocket, &from, &len);
+
 #ifdef _WIN32
         } while (sock == INVALID_SOCKET && WSAGetLastError() == WSAEINTR);
         if (sock == INVALID_SOCKET)
@@ -1980,23 +2245,42 @@ receiveTransportConnectionTCP(PRIVATE_NETWORKKEY ** network,
 #endif
     }
 
-    // create string containing numerical IP address.
-    OFString client_dns_name;
-    char client_ip_address[20];
-    sprintf(client_ip_address, "%-d.%-d.%-d.%-d",  // this code is ugly but thread safe
-       ((int) from.sa_data[2]) & 0xff,
-       ((int) from.sa_data[3]) & 0xff,
-       ((int) from.sa_data[4]) & 0xff,
-       ((int) from.sa_data[5]) & 0xff);
+    char client_ip_address[INET6_ADDRSTRLEN] = {0};
 
-    if (! dcmDisableGethostbyaddr.get())
-       client_dns_name = OFStandard::getHostnameByAddress(&from.sa_data[2], sizeof(struct in_addr), AF_INET);
+    switch (from.sa_family) {
+      case AF_INET: {
+        // use of reinterpret_cast preferred to C style cast
+        sockaddr_in *sin = reinterpret_cast<sockaddr_in*>(&from);
+        inet_ntop(AF_INET, &sin->sin_addr, client_ip_address, INET6_ADDRSTRLEN);
+        break;
+      }
+      case AF_INET6: {
+        sockaddr_in6 *sin = reinterpret_cast<sockaddr_in6*>(&from);
+        // inet_ntoa should be considered deprecated
+        inet_ntop(AF_INET6, &sin->sin6_addr, client_ip_address, INET6_ADDRSTRLEN);
+        break;
+      }
+      default:
+        abort();
+    }
+    //    char client_ip_address[20];
+    //    sprintf(client_ip_address, "%-d.%-d.%-d.%-d",  // this code is ugly but thread safe
+    //       ((int) from.sa_data[2]) & 0xff,
+    //       ((int) from.sa_data[3]) & 0xff,
+    //       ((int) from.sa_data[4]) & 0xff,
+    //       ((int) from.sa_data[5]) & 0xff);
+
+
+
+// create string containing numerical IP address.
+    OFString client_dns_name;
+//    if (!dcmDisableGethostbyaddr.get())
+//       client_dns_name = OFStandard::getHostnameByAddress(&from.sa_data[2], sizeof(struct in_addr), from.sa_family);
 
     if (client_dns_name.length() == 0)
     {
         // reverse DNS lookup disabled or host not found, use numerical address
-        OFStandard::strlcpy(params->callingPresentationAddress, client_ip_address,
-          sizeof(params->callingPresentationAddress));
+        OFStandard::strlcpy(params->callingPresentationAddress, client_ip_address, sizeof(params->callingPresentationAddress));
         OFStandard::strlcpy((*association)->remoteNode, client_ip_address, sizeof((*association)->remoteNode));
         DCMNET_DEBUG("Association Received: " << params->callingPresentationAddress );
     }
@@ -2193,11 +2477,11 @@ initializeNetworkTCP(PRIVATE_NETWORKKEY ** key, void *parameter)
 #else
       int sock;
 #endif
-      struct sockaddr_in server;
+      struct sockaddr_in6 server;
 
       /* Create socket for Internet type communication */
       (*key)->networkSpecific.TCP.port = *(int *) parameter;
-      (*key)->networkSpecific.TCP.listenSocket = socket(AF_INET, SOCK_STREAM, 0);
+      (*key)->networkSpecific.TCP.listenSocket = socket(AF_INET6, SOCK_STREAM, 0);
       sock = (*key)->networkSpecific.TCP.listenSocket;
 
 #ifdef _WIN32
@@ -2223,9 +2507,9 @@ initializeNetworkTCP(PRIVATE_NETWORKKEY ** key, void *parameter)
       }
 
       /* Name socket using wildcards */
-      server.sin_family = AF_INET;
-      server.sin_addr.s_addr = INADDR_ANY;
-      server.sin_port = (unsigned short) htons(OFstatic_cast(u_short, ((*key)->networkSpecific.TCP.port)));
+      server.sin6_family = AF_INET6;
+      server.sin6_addr  = in6addr_any;
+      server.sin6_port = (unsigned short) htons(OFstatic_cast(u_short, ((*key)->networkSpecific.TCP.port)));
       if (bind(sock, (struct sockaddr *) & server, sizeof(server)))
       {
         OFString msg = "TCP Initialization Error: ";
